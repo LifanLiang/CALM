@@ -1,0 +1,93 @@
+### Architeture for a CALM layer, multiple channel version. 
+### This version assumes uniform prior on both kernels and positions
+
+#N_kernels = 128 # Number of kernels in the output feature map
+#C_input = 64 # Number of kernels for input
+#width = 7 # Kernel size
+#size = 28 # Image size
+#pad = 3
+
+import torch
+import torchvision
+import torch.nn.functional as F
+import torch.nn as nn
+import os
+import numpy as np
+from torchvision import datasets
+from matplotlib import pyplot as plt
+from torchvision.transforms import ToTensor, Lambda
+
+use_cuda = torch.cuda.is_available()
+device = torch.device("cuda:0" if use_cuda else "cpu")
+torch.backends.cudnn.benchmark = True
+
+def softmax(pwm):
+    temp = torch.min(pwm, 1)[0]
+    return torch.log(torch.softmax(pwm - temp[:,None,:], 1))
+
+
+class batchEM(torch.nn.Module):
+    '''
+    Update parameters with batches of data.
+    '''
+    def __init__(self, N_kernels, C_input, width, size, pad):
+        super(batchEM, self).__init__()
+        
+        # Initialize parameters
+        self.N_kernels = N_kernels # The number of convolution kernels
+        self.C_input = C_input # The number of input channles
+        self.width = width # Convolution filter size
+        self.size = size # Image size (assuming square image)
+        self.pad = pad # Padding for convolution
+        
+        # Initialize model parameters
+        self.theta = torch.randn(N_kernels, C_input, width, width, device=device) # Ordinary convolution filters
+        #self.beta  = torch.log_softmax(torch.randn(N_kernels, device=device),0)
+        self.norm = nn.BatchNorm2d(N_kernels, affine=False, track_running_stats=False, momentum=0)
+        
+        # Initialize cached params
+        self.batch_beta = torch.zeros(N_kernels, device=device).log()
+        self.batch_theta = torch.zeros(self.theta.shape, device=device)
+        self.L2Norm = 0.5 * (self.theta**2).sum((1,2,3)) # 0.5*mu^2
+        self.batch_loglik = 0
+        
+        
+    def update_params(self):
+        # Update model parameters using cache
+        self.beta_exp = self.batch_beta.exp() 
+        self.beta_exp = (self.beta_exp + 1/self.beta_exp.sum()) / (self.beta_exp.sum()+1) * self.beta_exp.sum()# Pseudo count for numerical stability
+        self.theta = self.batch_theta / self.beta_exp[:,None,None,None]
+        #self.beta = torch.log_softmax(self.batch_beta, 0)
+        self.loglik = self.batch_loglik
+        self.L2Norm = 0.5 * (self.theta**2).sum((1,2,3))
+        
+        # Empty cache
+        self.batch_beta = torch.zeros(self.N_kernels, device=device).log()
+        self.batch_theta = torch.zeros(self.theta.shape, device=device)
+        self.batch_loglik = 0
+        
+    def posterior(self,X):
+        # Compute log posterior of Z by integrating out U.
+        joint_lik = F.conv2d(X, self.theta, bias=-self.L2Norm, padding=self.pad)
+        return torch.logsumexp(joint_lik, (2,3))
+    
+    def posterior2(self, X): # output log likelihood of U and Z
+        return self.norm(F.conv2d(X, self.theta, bias=-self.L2Norm, padding=self.pad))
+                    
+    def forward(self, X):
+        # E-step: Compute joint posterior of U and Z
+        joint_lik = F.conv2d(X, self.theta, bias=-self.L2Norm, padding=self.pad)
+        p_x = torch.logsumexp(joint_lik, (1,2,3)) # Unnormalized marginal likelihood of each sample
+        gamma = (joint_lik - p_x[:,None,None,None]) # Exactly log joint posterior of U and Z
+        
+        # M-step: cache parameter estimates
+        self.batch_beta = torch.logaddexp(self.batch_beta, torch.logsumexp(gamma,(0,2,3))) # Also the effective sample size for each kernel
+        self.batch_loglik += p_x.sum()
+        
+        ## Theta estimation using the posterior as convolution kernel
+        ## Apply grouped convolution kernel of gamma on X. 
+
+        egamma = gamma.reshape(gamma.shape[0]*gamma.shape[1],1,1,gamma.shape[2],gamma.shape[3]).exp()
+        temp = F.conv3d(X[None,:], egamma, groups=X.shape[0], padding=(0,self.pad,self.pad)).squeeze()
+        self.batch_theta += temp.reshape(X.shape[0], self.N_kernels, self.C_input, self.width, self.width).sum(0)
+
