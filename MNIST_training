@@ -7,6 +7,7 @@ import numpy as np
 from torchvision import datasets
 from matplotlib import pyplot as plt
 from torchvision.transforms import ToTensor, Lambda
+from sklearn.linear_model import LogisticRegression
 import model_def
 
 use_cuda = torch.cuda.is_available()
@@ -53,3 +54,28 @@ plt.plot(range(1, len(loglik)+1), loglik)
 ### Visualize the kernels after training
 grid = torchvision.utils.make_grid(em.theta, nrow=8)
 plt.imshow(grid.permute((1,2,0)).cpu().numpy())
+
+### Extract image-wide feature activation
+N = len(mnist_trainset.data)
+batches = list(BatchSampler(SequentialSampler(range(N)), batch_size = 1000, drop_last=False))
+feats = torch.Tensor(len(train_tr), em.theta.shape[0])
+
+with torch.no_grad():
+    for b in batches:
+        feats[b] = em.posterior(train_tr[b][:,None].to(device)).to("cpu")
+
+N = len(mnist_testset.data)
+batches = list(BatchSampler(SequentialSampler(range(N)), batch_size = 1000, drop_last=False))
+feats_test = torch.Tensor(len(test_tr), em.theta.shape[0])
+
+with torch.no_grad():
+    for b in batches:
+        feats_test[b] = em.posterior(test_tr[b][:,None].to(device)).to("cpu")
+
+
+### Softmax regression to evaluate performance
+clf = LogisticRegression(random_state=0, multi_class='multinomial').fit(feats, mnist_trainset.targets)
+clf.score(feats, mnist_trainset.targets)
+clf.score(feats_test, mnist_testset.targets)
+
+
