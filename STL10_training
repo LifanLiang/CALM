@@ -1,0 +1,120 @@
+import torch
+import torchvision
+import torch.nn.functional as F
+import torch.nn as nn
+import os
+import numpy as np
+from torchvision import datasets
+from matplotlib import pyplot as plt
+from torchvision.transforms import ToTensor, Lambda
+import model_def
+
+use_cuda = torch.cuda.is_available()
+device = torch.device("cuda:0" if use_cuda else "cpu")
+torch.backends.cudnn.benchmark = True
+
+os.chdir('/path/to/stl10/repo')
+stl10_trainset = datasets.STL10(root='stl10', split='train+unlabeled', download=True, transform=ToTensor())
+stl10_testset = datasets.STL10(root='stl10', split='test', download=True, transform=ToTensor())
+
+### Zero-phase component analysis code from 
+### https://jermwatt.github.io/control-notes/posts/zca_sphereing/ZCA_Sphereing.html
+# sphereing pre-processing functionality 
+def PCA(x,**kwargs):
+    # regularization parameter for numerical stability
+    lam = 10**(-7)
+    if 'lam' in kwargs:
+        lam = kwargs['lam']
+
+    # create the correlation matrix
+    P = float(x.shape[1])
+    Cov = 1/P*np.dot(x,x.T) + lam*np.eye(x.shape[0])
+
+    # use numpy function to compute eigenvalues / vectors of correlation matrix
+    d,V = np.linalg.eigh(Cov)
+    return d,V
+
+# ZCA spherer 
+def ZCA_spherer(x,**kwargs):
+    # Step 1: mean-center the data
+    x_means = np.mean(x,axis = 1)[:,np.newaxis]
+    x_centered = x - x_means
+
+    # Step 2: compute pca transform on mean-centered data
+    d,V = PCA(x_centered,**kwargs)
+
+    # Step 3: divide off standard deviation of each (transformed) input, 
+    # which are equal to the returned eigenvalues in 'd'.  
+    stds = (d[:,np.newaxis])**(0.5)
+
+    # check to make sure thta x_stds > small threshold, for those not
+    # divide by 1 instead of original standard deviation
+    ind = np.argwhere(stds < 10**(-5))
+    if len(ind) > 0:
+        ind = [v[0] for v in ind]
+        adjust = np.zeros((stds.shape))
+        adjust[ind] = 1.0
+        stds += adjust
+
+    # create normalizer / inverse-normalizer
+    return np.dot(V,np.dot(V.T,x_centered)/stds) 
+
+data_ZCA = np.array([ZCA_spherer(stl10_trainset.data[i,j]) for i in range(len(stl10_trainset.data)) for j in range(3)]).reshape(len(stl10_trainset.data),3,96,96)
+test_ZCA = np.array([ZCA_spherer(stl10_testset.data[i,j]) for i in range(len(stl10_testset.data)) for j in range(3)]).reshape(len(stl10_testset.data),3,96,96)
+
+### Training CALM layer
+from torch.utils.data import SequentialSampler
+from torch.utils.data import BatchSampler
+
+X_train = data_ZCA#[stl10_trainset.labels>-1] # Uncomment the previous bracket to train with labeled data only
+#train_Y = torch.tensor(stl10_trainset.labels[stl10_trainset.labels>-1], dtype=torch.int64)
+N = len(X_train)
+batches = list(BatchSampler(SequentialSampler(range(N)), batch_size = 200, drop_last=False))
+em = batchEM(200, 3, 15, 96, 0).to(device)
+em.eval()
+loglik = []
+with torch.no_grad():
+    for i in range(10):
+        for b in batches:
+            local_X = torch.Tensor(X_train[b]).to(device)
+            em.forward(local_X)
+        em.update_params()
+        NAN = torch.isnan(em.theta).sum().item()
+        print(NAN)
+        if NAN > 0: 
+            print("Reached numerical precision limit")
+            break
+        loglik.append(em.loglik.item())
+        print('Epoch',i+1,'Log model likelihood:', loglik[-1])
+
+### Plot changes of log likelihood
+plt.plot(loglik)
+
+### Visualize the first 64 features
+grid = torchvision.utils.make_grid(minmax4d(em.theta[:64]), nrow=8)
+plt.imshow(grid.permute((1,2,0)).cpu().numpy(), interpolation='none')
+
+### Marginal likelihood computation
+supervised_X = X_train
+N = len(supervised_X)
+batches = list(BatchSampler(SequentialSampler(range(N)), batch_size = 1000, drop_last=False))
+feats = torch.Tensor(N, em.theta.shape[0])
+with torch.no_grad():
+    for b in batches:
+        feats[b] = em.posterior(torch.Tensor(supervised_X[b]).to(device)).to("cpu")
+
+test_X = test_ZCA
+N = len(test_X)
+batches = list(BatchSampler(SequentialSampler(range(N)), batch_size = 1000, drop_last=False))
+feats_test = torch.Tensor(N, em.theta.shape[0])
+with torch.no_grad():
+    for b in batches:
+        feats_test[b] = em.posterior(torch.Tensor(test_X[b]).to(device)).to("cpu")
+
+### Use softmax regression from skleran to evaluate performance
+from sklearn.linear_model import LogisticRegression
+
+supervised_Y = stl10_trainset.labels[stl10_trainset.labels>-1]
+clf = LogisticRegression(random_state=0, multi_class='multinomial', max_iter=1000).fit(feats, supervised_Y)
+clf.score(feats, supervised_Y)
+clf.score(feats_test, test_Y)
