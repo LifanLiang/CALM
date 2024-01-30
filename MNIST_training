@@ -1,0 +1,55 @@
+import torch
+import torchvision
+import torch.nn.functional as F
+import torch.nn as nn
+import os
+import numpy as np
+from torchvision import datasets
+from matplotlib import pyplot as plt
+from torchvision.transforms import ToTensor, Lambda
+import model_def
+
+use_cuda = torch.cuda.is_available()
+device = torch.device("cuda:0" if use_cuda else "cpu")
+torch.backends.cudnn.benchmark = True
+
+os.chdir('path/to/mnist/repo/')
+mnist_trainset = datasets.MNIST(root='mnist', train=True, download=True, transform=ToTensor(),
+                                 target_transform=torchvision.transforms.Compose([
+                                 lambda x:torch.LongTensor([x])]))
+mnist_testset = datasets.MNIST(root='mnist', train=False, download=True, transform=ToTensor())
+train = mnist_trainset.data.float()
+test = mnist_testset.data.float()
+train_tr = train/255
+
+### EM update to learn kernel parameters
+
+from torch.utils.data import SequentialSampler
+from torch.utils.data import BatchSampler
+
+N = len(mnist_trainset.data)
+batches = list(BatchSampler(SequentialSampler(range(N)), batch_size = 1000, drop_last=False))
+em = model_def.batchEM(64, 1, 20, 28, 2).to(device)
+loglik = []
+with torch.no_grad():
+    for i in range(15):
+        for b in batches:
+            torch.cuda.empty_cache()
+            local_X = train_tr[b][:,None].to(device)
+            em.forward(local_X)
+            #print(torch.isneginf(em.test).sum())
+        NAN = torch.isnan(em.batch_theta).sum()
+        print(NAN)
+        if NAN > 0: 
+            print("Reached numerical precision limit")
+            break
+        em.update_params()
+        loglik.append(em.loglik.item())
+        print('Epoch',i+1,'Log model likelihood:', loglik[-1])
+
+### Plot the change of log likelihood
+plt.plot(range(1, len(loglik)+1), loglik)
+
+### Visualize the kernels after training
+grid = torchvision.utils.make_grid(em.theta, nrow=8)
+plt.imshow(grid.permute((1,2,0)).cpu().numpy())
